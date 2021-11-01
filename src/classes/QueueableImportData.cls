@@ -3,56 +3,107 @@
  */
 
 public with sharing class QueueableImportData implements Queueable {
-    public class ImportException extends Exception {
-    }
+    static final Integer RECORDS_PER_CHUNK = 200;
     private List<ImportDataService.DataloaderTable> dataloaderTables;
-    private Map<String, String> newIdsByOldIds;
+    private Map<String, String> newRecordIdsByExternalIds;
+    private List<String> fieldNames {
+        get {
+            return dataloaderTables[0].fieldNames;
+        }
+    }
+    private String objectName {
+        get {
+            return dataloaderTables[0].objectName;
+        }
+    }
+    private List<String> recordPrototypes {
+        get {
+            return dataloaderTables[0].recordPrototypes;
+        }
+    }
     public QueueableImportData(List<ImportDataService.DataloaderTable> dataloaderTables, Map<String, String> newIdsByOldIds) {
         this.dataloaderTables = dataloaderTables;
-        this.newIdsByOldIds = newIdsByOldIds;
+        this.newRecordIdsByExternalIds = newIdsByOldIds;
     }
     public void execute(QueueableContext context) {
-        List<String> fieldNames = dataloaderTables[0].fieldNames;
-        String objectName = dataloaderTables[0].objectName;
-        String[] inputData = new String[]{
-        };
+        System.debug(dataloaderTables[0].recordPrototypes);
         List<String> oldIds = new List<String>();
-        SObjectType schemaType = Schema.getGlobalDescribe().get(objectName);
-        SObject record = schemaType.newSObject();
-        List<SObject> sObjects = new List<SObject>();
-        for (Integer i = 0; i < dataloaderTables[0].recordPrototypes.size(); i++) {
-            inputData = dataloaderTables[0].recordPrototypes[i].split('","');
-            dataloaderTables[0].recordPrototypes.remove(i);
-            for (Integer c = 1; c < fieldNames.size(); c++) {
-                if (inputData[c].contains('$')) {
-                    if (newIdsByOldIds.get(inputData[c].replace('$', '')) == null) {
-                        throw new ImportException('Invalid data. Number: '+c + ' Id: ' + inputData[c] );
+        SObjectType objectType = Schema.getGlobalDescribe().get(objectName);
+        SObject record = objectType.newSObject();
+        List<SObject> records = new List<SObject>();
+        List<String> inputData;
+        for (Integer i = 0; i < RECORDS_PER_CHUNK && recordPrototypes.size() > 0; i++) {
+            inputData = getFieldData(recordPrototypes[i]);
+            recordPrototypes.remove(i);
+
+            for (Integer j = 0; j < fieldNames.size(); j++) {
+                Object value = getAppropriateObject(objectType, fieldNames[j], inputData[j]);
+
+                if (inputData[j].contains('$')) {
+                    if (newRecordIdsByExternalIds.get(inputData[j].replace('$', '')) == null) {
+                        throw new ImportException('Invalid data. Line: ' + i + 1 + ' Id: ' + inputData[j]);
                     }
-                    record.put(fieldNames[c], newIdsByOldIds.get(inputData[c].replace('$', '')));
-                    continue;
-
+                    value = newRecordIdsByExternalIds.get(inputData[j].replace('$', ''));
                 }
-                record.put(fieldNames[c], inputData[c].replace('"', ''));
-                if(c>=200) {
-                    break;
-                }
-
+                record.put(fieldNames[j], value);
             }
-            sObjects.add(record);
-            oldIds.add(inputData[0].replace('"', ''));
+            records.add(record);
+            oldIds.add(inputData[0]);
         }
-        List<Database.SaveResult> insertResults = Database.insert(sObjects, true);
-        for (Integer i = 0; i < insertResults.size(); i++) {
-            if (!insertResults[i].isSuccess()) {
-            } else {
-                newIdsByOldIds.put(oldIds[i], sObjects[i].Id);
-            }
+        insert records;
+        for (Integer i = 0; i < records.size(); i++) {
+            newRecordIdsByExternalIds.put(oldIds[i], records[i].Id);
         }
-        if (dataloaderTables[0].recordPrototypes.isEmpty()) {
+        if (recordPrototypes.isEmpty()) {
             dataloaderTables.remove(0);
         }
         if (!dataloaderTables.isEmpty()) {
-            System.enqueueJob(new QueueableImportData(dataloaderTables, newIdsByOldIds));
+            System.enqueueJob(new QueueableImportData(dataloaderTables, newRecordIdsByExternalIds));
         }
     }
+
+    public Object getAppropriateObject(SObjectType objectType, String fieldName, Object value) {
+        DescribeFieldResult describeFieldResult = objectType.getDescribe().fields.getMap().get(fieldName).getDescribe();
+        if (describeFieldResult.isUpdateable()) {
+            DisplayType type = describeFieldResult.type;
+            if (type == DisplayType.BOOLEAN) {
+                return Boolean.valueOf(value);
+            } else if (type == DisplayType.DATE) {
+                return Date.valueOf(value);
+            } else if (type == DisplayType.DATETIME) {
+                return Datetime.valueOf(value);
+
+            } else if (type == DisplayType.INTEGER) {
+                return Integer.valueOf(value);
+
+            } else if (type == DisplayType.DOUBLE) {
+                return Double.valueOf(value);
+            } else {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    public List<String> getFieldData(String record) {
+        List<String> chars = record.split('');
+        String fieldData = '';
+        List<String> fieldDataList = new List<String>();
+        Integer count = 0;
+        for (Integer i = 0; i < chars.size(); i++) {
+            if (chars[i] == '"') {
+                count++;
+            }
+            fieldData = fieldData + chars[i];
+            if ((chars[i] == ',' || i == chars.size() - 1) && Math.mod(count, 2) == 0) {
+                fieldDataList.add(fieldData.removeEnd(',').removeEnd('"').removeStart('"'));
+                fieldData = '';
+            }
+        }
+        return fieldDataList;
+    }
+
+    public class ImportException extends Exception {
+    }
+
 }
